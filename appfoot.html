@@ -1,0 +1,315 @@
+# appfot
+from flask import Flask, request, render_template, send_from_directory
+import cv2
+import numpy as np
+import os
+import math
+import uuid
+from datetime import datetime # Import datetime for current year in footer
+from numba import njit, prange
+app = Flask(__name__)
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+
+
+
+
+
+
+
+
+    # =====================================================
+    # 1) รับไฟล์จากผู้ใช้
+    # =====================================================
+    if 'file' not in request.files:
+        return "❌ ไม่พบไฟล์"
+
+    file = request.files['file']
+    if file.filename == '':
+        return "❌ ไม่ได้เลือกไฟล์"
+
+    filename = str(uuid.uuid4()) + os.path.splitext(file.filename)[1]
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    # =====================================================
+    # 2) อ่านภาพ
+    # =====================================================
+    img = cv2.imread(filepath)
+    if img is None:
+        return "❌ อ่านภาพไม่ได้"
+
+    original_img = img.copy()
+
+    # =====================================================
+    # 3) แยกรอยเท้า (Threshold)
+    # =====================================================
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+
+    _, mask = cv2.threshold(
+        blur, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    kernel = np.ones((9,9), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # =====================================================
+    # 4) หา contour ใหญ่สุด = เท้า
+    # =====================================================
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if len(contours) == 0:
+        return "❌ ไม่พบรอยเท้า"
+
+    foot_contour = max(contours, key=cv2.contourArea)
+
+    foot_mask = np.zeros_like(mask)
+    cv2.drawContours(foot_mask, [foot_contour], -1, 255, -1)
+
+    # =====================================================
+    # 5) เติมพื้นที่ช่องโหว่ในรอยเท้า (Hole Filling)
+    # =====================================================
+    h, w = foot_mask.shape
+    floodfill = foot_mask.copy()
+    mask_ff = np.zeros((h+2, w+2), np.uint8)
+
+    cv2.floodFill(floodfill, mask_ff, (0,0), 255)
+    floodfill_inv = cv2.bitwise_not(floodfill)
+
+    foot_mask_filled = foot_mask | floodfill_inv
+
+    # =====================================================
+    # 6) หาแกนเท้า (Foot Axis) ด้วย PCA
+    # =====================================================
+    pts = np.column_stack(np.where(foot_mask_filled > 0)).astype(np.float32)
+
+    mean, eigenvectors = cv2.PCACompute(pts, mean=None)
+    axis_vector = eigenvectors[0]
+
+    angle = np.arctan2(axis_vector[1], axis_vector[0]) * 180 / np.pi
+
+    # =====================================================
+    # 7) หมุนภาพให้เท้าตั้งตรง
+    # =====================================================
+    center = (w//2, h//2)
+    rot_mat = cv2.getRotationMatrix2D(center, angle-90, 1.0)
+
+    rotated_mask = cv2.warpAffine(
+        foot_mask_filled, rot_mat, (w, h),
+        flags=cv2.INTER_NEAREST
+    )
+
+    rotated_img = cv2.warpAffine(
+        original_img, rot_mat, (w, h)
+    )
+
+    # =====================================================
+    # 8) ตรวจสอบว่าหัวเท้าหันขึ้นหรือไม่ (Flip correction)
+    # =====================================================
+    ys, xs = np.where(rotated_mask > 0)
+    top_area = np.sum(ys < h*0.25)
+    bottom_area = np.sum(ys > h*0.75)
+
+    # ถ้าพื้นที่หนักไปอยู่ล่าง → กลับภาพ
+    if bottom_area > top_area:
+        rotated_mask = cv2.flip(rotated_mask, 0)
+        rotated_img  = cv2.flip(rotated_img, 0)
+
+    # =====================================================
+    # 9) ตัดนิ้วเท้าออก (Largest Circle Detection)
+    # =====================================================
+    dist = cv2.distanceTransform(rotated_mask, cv2.DIST_L2, 5)
+    minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(dist)
+
+    toe_center = maxLoc
+    toe_radius = int(maxVal * 0.9)
+
+    toe_mask = np.zeros_like(rotated_mask)
+    cv2.circle(toe_mask, toe_center, toe_radius, 255, -1)
+
+    # ลบนิ้วออกจากเท้า
+    rotated_mask_no_toe = cv2.subtract(rotated_mask, toe_mask)
+
+    # =====================================================
+    # 10) หา top / bottom ใหม่ หลังตัดนิ้ว
+    # =====================================================
+    ys, xs = np.where(rotated_mask_no_toe > 0)
+    if len(ys) == 0:
+        return "❌ ไม่พบพื้นที่เท้าหลังตัดนิ้ว"
+
+    top_y = np.min(ys)
+    bottom_y = np.max(ys)
+    foot_length = bottom_y - top_y
+
+    if foot_length <= 0:
+        return "❌ ความยาวเท้าผิดพลาด"
+
+    # =====================================================
+    # 11) แบ่งพื้นที่ A B C
+    # =====================================================
+    h1 = int(top_y + foot_length / 3)
+    h2 = int(top_y + 2 * foot_length / 3)
+
+    mask_A = np.zeros_like(rotated_mask_no_toe)
+    mask_B = np.zeros_like(rotated_mask_no_toe)
+    mask_C = np.zeros_like(rotated_mask_no_toe)
+
+    mask_A[top_y:h1, :] = rotated_mask_no_toe[top_y:h1, :]
+    mask_B[h1:h2, :]    = rotated_mask_no_toe[h1:h2, :]
+    mask_C[h2:bottom_y+1, :] = rotated_mask_no_toe[h2:bottom_y+1, :]
+
+    # =====================================================
+    # 12) คำนวณพื้นที่
+    # =====================================================
+    area_A = int(np.sum(mask_A > 0))
+    area_B = int(np.sum(mask_B > 0))
+    area_C = int(np.sum(mask_C > 0))
+
+    total_area = area_A + area_B + area_C
+    arch_index = area_B / total_area
+
+    # =====================================================
+    # 13) แปลผลชนิดเท้า
+    # =====================================================
+    if arch_index > 0.26:
+        foot_type = "Flat Foot (เท้าแบน)"
+
+    else:
+        foot_type = "Normal Foot (ปกติ)"
+
+    # =====================================================
+    # 14) วาดเส้น + วงกลมนิ้ว
+    # =====================================================
+    draw_img = rotated_img.copy()
+
+    cv2.line(draw_img, (0, top_y), (w, top_y), (255,0,0), 2)
+    cv2.line(draw_img, (0, h1), (w, h1), (0,255,0), 2)
+    cv2.line(draw_img, (0, h2), (w, h2), (0,255,255), 2)
+    cv2.line(draw_img, (0, bottom_y), (w, bottom_y), (255,0,0), 2)
+
+    cv2.circle(draw_img, toe_center, toe_radius, (0,0,255), 2)
+
+    # =====================================================
+    # 15) บันทึกผลลัพธ์
+    # =====================================================
+    result_name = "result_" + filename
+    mask_name   = "mask_" + filename
+
+    cv2.imwrite(os.path.join(app.config['RESULT_FOLDER'], result_name), draw_img)
+    cv2.imwrite(os.path.join(app.config['RESULT_FOLDER'], mask_name), rotated_mask_no_toe)
+
+    os.remove(filepath)
+
+
+    diagram_w = 600
+    diagram_h = 300
+
+    diagram = np.ones((diagram_h, diagram_w, 3), dtype=np.uint8) * 255
+
+# -----------------------------
+# แปลงค่า Arch Index → ความสูง (pixel)
+# -----------------------------
+    min_ai = 0.15
+    max_ai = 0.35
+
+    min_h = 20      # px (แบน)
+    max_h = 120     # px (โค้งสูง)
+
+    ai = np.clip(arch_index, min_ai, max_ai)
+
+    arch_height = int(
+    min_h + (ai - min_ai) / (max_ai - min_ai) * (max_h - min_h)
+)
+
+# -----------------------------
+# กำหนดจุดโครงสร้าง
+# -----------------------------
+    baseline_y = 220
+
+    P1 = (50, baseline_y)                             # ส้นเท้า
+    P2 = (diagram_w // 2, baseline_y - arch_height)   # กลางเท้า
+    P3 = (diagram_w - 50, baseline_y)                 # ปลายเท้า
+
+# -----------------------------
+# วาดเส้นโครงสร้าง
+# -----------------------------
+    points = np.array([P1, P2, P3], np.int32)
+    cv2.polylines(diagram, [points], False, (0,0,0), 3)
+
+    cv2.circle(diagram, P1, 6, (255,0,0), -1)
+    cv2.circle(diagram, P2, 8, (0,0,255), -1)
+    cv2.circle(diagram, P3, 6, (255,0,0), -1)
+
+# เส้นพื้น
+    cv2.line(
+    diagram,
+    (30, baseline_y),
+    (diagram_w-30, baseline_y),
+    (180,180,180),
+    2
+)
+# -----------------------------
+# ขนาดกระดาษ A4 (cm)
+# -----------------------------
+    A4_WIDTH_CM  = 21.0
+    A4_HEIGHT_CM = 29.7
+
+    img_h, img_w = original_img.shape[:2]
+
+# สเกล cm / pixel
+    scale_x = A4_WIDTH_CM / img_w
+    scale_y = A4_HEIGHT_CM / img_h
+
+# ใช้แกน Y เพราะ arch_height คือความสูงแนวดิ่ง
+    arch_height_cm = arch_height * scale_y
+    cv2.putText(
+    diagram,
+    f"Arch Index = {arch_index:.3f}",
+    (30, 40),
+    cv2.FONT_HERSHEY_SIMPLEX,
+    1,
+    (0,0,0),
+    2
+)
+
+    cv2.putText(
+        diagram,
+        f"Arch Height = {arch_height}px",
+        (30, 80),
+    cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (50,50,50),
+        2
+)
+
+    cv2.putText(
+        diagram,
+        f"Real Height ≈ {arch_height_cm:.2f} cm",
+        (30, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (20,100,20),
+        2
+)
+    diagram_name = "diagram_" + filename
+    diagram_path = os.path.join(app.config['RESULT_FOLDER'], diagram_name)
+    cv2.imwrite(diagram_path, diagram)
+
+    results = {
+    "Area A": area_A,
+    "Area B": area_B,
+    "Area C": area_C,
+    "Arch Index": round(arch_index, 3),
+    "Foot Type": foot_type,
+    "Arch Height (px)": arch_height,
+    "Arch Height (cm)": f"{arch_height_cm:.2f} cm",
+    "Result Image": result_name,
+    "Mask Image": mask_name,
+    "Diagram Image": diagram_name
+}
